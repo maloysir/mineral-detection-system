@@ -1,372 +1,256 @@
-
-## ============================================================
-# MINERAL CLASSIFICATION SYSTEM
-# DINOv2 + MLP + MAHALANOBIS OOD
-# STREAMLIT APPLICATION
-# ============================================================
+import os
+import numpy as np
 import streamlit as st
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
-import numpy as np
+import torch.nn as nn                 
+import torch.nn.functional as F
 from PIL import Image
 import pickle
-import os
-
+from torchvision import transforms
+from torchvision.models import resnet50
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-AUTHORS_DIR = os.path.join(BASE_DIR, "authors")
 
-# ------------------------------------------------------------
-# DEVICE
-# ------------------------------------------------------------
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ------------------------------------------------------------
-# TORCH HUB CACHE
-# ------------------------------------------------------------
-torch.hub.set_dir("torch_cache")
+# ---- CONFIG ----
+MODEL_PATH = "best_resnet50.pth"
+DEVICE = torch.device("cpu")
 
-# ------------------------------------------------------------
-# CLASSES (FIXED)
-# ------------------------------------------------------------
-CLASSES = ["gem", "crystal", "mineral_ore", "mineral"]
+# ---- CLASSES (MUST MATCH TRAINING ORDER) ----
+CLASSES = [
+    "biotite",
+    "bornite",
+    "chrysocolla",
+    "malachite",
+    "muscovite",
+    "pyrite",
+    "quartz"
+]
 
-IMG_SIZE = 224
-
-# ------------------------------------------------------------
-# IMAGE TRANSFORM
-# ------------------------------------------------------------
-transform = T.Compose([
-    T.Resize((IMG_SIZE, IMG_SIZE)),
-    T.ToTensor(),
-    T.Normalize(
-        mean=(0.485,0.456,0.406),
-        std=(0.229,0.224,0.225)
+# ---- TRANSFORM (IDENTICAL TO TRAINING VAL TRANSFORM) ----
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
     )
 ])
 
-# ------------------------------------------------------------
-# LOAD DINOv2
-# ------------------------------------------------------------
+# ---- MODEL LOADING ----
 @st.cache_resource
-def load_dino():
-    model = torch.hub.load(
-        "facebookresearch/dinov2",
-        "dinov2_vits14",
-        trust_repo=True
-    )
-    model.eval()
-    model.to(DEVICE)
-    return model
+def load_model():
+    model = resnet50(weights=None)
 
-dino = load_dino()
-
-# ------------------------------------------------------------
-# MLP CLASSIFIER
-# ------------------------------------------------------------
-class MLP_MMD(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        self.fc1 = nn.Linear(384,256)
-        self.bn1 = nn.BatchNorm1d(256)
-
-        self.fc2 = nn.Linear(256,64)
-        self.bn2 = nn.BatchNorm1d(64)
-
-        self.classifier = nn.Linear(64,4)
-
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(0.2)
-
-    def forward(self,x):
-        x = self.drop(self.act(self.bn1(self.fc1(x))))
-        feat = self.act(self.bn2(self.fc2(x)))
-        logits = self.classifier(feat)
-        return logits
-
-# ------------------------------------------------------------
-# LOAD TRAINED CLASSIFIER
-# ------------------------------------------------------------
-@st.cache_resource
-def load_classifier():
-
-    if not os.path.exists("best_model.pth"):
-        st.error("best_model.pth not found in project folder")
-        st.stop()
-
-    model = MLP_MMD().to(DEVICE)
+    # MUST match training
+    model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
 
     model.load_state_dict(
-        torch.load("best_model.pth", map_location=DEVICE)
+        torch.load(MODEL_PATH, map_location=DEVICE)
     )
 
+    model.to(DEVICE)
     model.eval()
     return model
 
-model = load_classifier()
+model = load_model()
 
-# ------------------------------------------------------------
-# LOAD OOD STATISTICS
-# ------------------------------------------------------------
-@st.cache_resource
-def load_stats():
+# Feature extractor
+feature_extractor = nn.Sequential(*list(model.children())[:-1])
+feature_extractor.to(DEVICE)
+feature_extractor.eval()
 
-    if not os.path.exists("ood_stats.pkl"):
-        st.error("ood_stats.pkl not found in project folder")
-        st.stop()
-
-    with open("ood_stats.pkl","rb") as f:
-        stats = pickle.load(f)
-
-    means = stats["means"]
-    inv_cov = stats["inv_cov"]
-    threshold = stats["threshold"]
-
-    return means, inv_cov, threshold
-
-means, inv_cov, OOD_THRESHOLD = load_stats()
-
-# ------------------------------------------------------------
-# FEATURE EXTRACTION
-# ------------------------------------------------------------
-def extract_feature(image):
-
-    img = transform(image).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        feat = dino(img)
-
-    feat = torch.nn.functional.normalize(feat,p=2,dim=1)
-
-    return feat.cpu().numpy()[0]
-
-# ------------------------------------------------------------
-# MAHALANOBIS DISTANCE (FIXED)
-# ------------------------------------------------------------
-def mahalanobis(x, mean):
+# Load OOD stats  ← 🔴 THIS SECTION
+def mahalanobis(x, mean, inv_cov):
     diff = x - mean
-    return float(np.sqrt(np.maximum(diff.T @ inv_cov @ diff, 1e-12)))
+    dist = np.sqrt(diff.T @ inv_cov @ diff)
+    return dist
+with open("ood_stats_resnet.pkl", "rb") as f:
+    stats = pickle.load(f)
 
-# ------------------------------------------------------------
-# CLASSIFICATION (FIXED dtype)
-# ------------------------------------------------------------
-def classify_feature(feature):
+means = stats["means"]
+inv_cov = stats["inv_cov"]
+threshold = stats["threshold"]
 
-    x = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-    with torch.no_grad():
-        logits = model(x)
-        probs = torch.softmax(logits,dim=1)
-        pred = torch.argmax(probs,dim=1).item()
 
-    label = CLASSES[pred]
-
-    d = mahalanobis(feature, means[label])
-
-    if d > OOD_THRESHOLD:
-        label = "unknown"
-
-    return label, probs.cpu().numpy()[0]
-
-# ============================================================
-# STREAMLIT USER INTERFACE (UNCHANGED)
-# ============================================================
-
-SAMPLES_DIR = os.path.join(BASE_DIR, "samples")
-
-st.set_page_config(
-    page_title="Geological Material Detection",
-    layout="wide"
-)
-
-st.markdown("""
-<style>
-html, body, [class*="css"] { font-size:26px; }
-h1 { font-size:80px !important; font-weight:700; }
-h2 { font-size:52px !important; }
-h3 { font-size:40px !important; }
-p, li { font-size:26px !important; line-height:1.7; }
-.navbar{text-align:center;font-size:28px;margin-top:16px;margin-bottom:16px;}
-.navbar a{text-decoration:none;color:#333;padding:12px 24px;font-weight:700;}
-.navbar a:hover{color:#0d6efd;border-bottom:4px solid #0d6efd;}
-</style>
-""", unsafe_allow_html=True)
-
+# ---- LOGO + TITLE ----   ← PUT IT HERE
 col1, col2, col3 = st.columns([1,6,1])
 
 with col1:
     inst_logo = os.path.join(BASE_DIR, "nitn.logo.png")
     if os.path.exists(inst_logo):
-        st.image(inst_logo, width=300)
+        st.image("nitn.logo.png", width=200)
 
 with col2:
     st.markdown(
-        "<h1 style='text-align:center;'>Geological Material Detection</h1>",
-        
-        
+        "<h1 style='text-align:center;'>Mineralogical Material Detection</h1>",
         unsafe_allow_html=True
     )
 
 with col3:
     texmin_logo = os.path.join(BASE_DIR, "texmin_logo.png")
     if os.path.exists(texmin_logo):
-        st.image(texmin_logo, width=300)
+       st.image("texmin_logo.png", width=200)
 
-st.markdown("""<div class="navbar"><a href="?section=home">Home</a>""", unsafe_allow_html=True)
-st.markdown("<hr style='border:2px dotted gray'>", unsafe_allow_html=True)
+st.markdown("<hr>", unsafe_allow_html=True)
 
-query_params = st.query_params
-section = query_params.get("section", "home")
 
-# HOME SECTION
-# =================================
-if section == "home":
 
-    st.subheader("Image Input")
+st.subheader("Mineral Image Input")
 
-    image = None
+image = None
 
-    input_mode = st.radio(
-        "Choose Input Method",
-        ["Dropdown", "Camera", "Upload"],
-        horizontal=True
-    )
-# --------------------------------
-# DROPDOWN
-# --------------------------------
-    if input_mode == "Dropdown":
+input_mode = st.radio(
+    "Choose Input Method",
+    ["Dropdown", "Camera", "Upload"],
+    horizontal=True
+)
 
-        samples = {
-        "mineral (epidote)": ("mineral","epidote.png"),
-        "crystal (gypsum)": ("crystal","gypsum.png"),
-        "mineral (Biotite)": ("mineral","Biotite.png"),
-        
-        }
+SAMPLES_DIR = "samples"
 
-        option = st.selectbox(
-            "Select mineral sample",
-            ["None"] + list(samples.keys())
-        )
+# ---------------- DROPDOWN ----------------
 
-        if option != "None":
-            _, file_name = samples[option]
-            sample_path = os.path.join(SAMPLES_DIR, file_name)
+if input_mode == "Dropdown":
 
-            if os.path.exists(sample_path):
-                image = Image.open(sample_path).convert("RGB")
-                st.image(image, width=350)
-# --------------------------------
-# CAMERA
- # --------------------------------
-    elif input_mode == "Camera":
-        cam = st.camera_input("Capture mineral image")
-        if cam is not None:
-            image = Image.open(cam).convert("RGB")
-# --------------------------------
-# UPLOAD
-# --------------------------------
-    elif input_mode == "Upload":
-        uploaded = st.file_uploader(
-            "Upload mineral image",
-            type=["jpg", "jpeg", "png"]
-        )
-        if uploaded:
-            image = Image.open(uploaded).convert("RGB")
+    samples = {
+        "biotite": "biotite.png",
+        "bornite": "bornite.png",
+        "chrysocolla": "chrysocolla.png",
+        "malachite": "malachite.png",
+        "muscovite": "muscovite.png",
+        "pyrite": "pyrite.png",
+        "quartz": "quartz.png"
+    }
 
-    st.markdown("<hr style='border:2px dotted gray'>", unsafe_allow_html=True)
-# --------------------------------------------------------
-# PROCESSING + RESULT
-# --------------------------------------------------------
-    if image is not None:
+    option = st.selectbox("Select sample", ["None"] + list(samples.keys()))
 
-        st.image(image, width=400)
+    if option != "None":
+        path = os.path.join(SAMPLES_DIR, samples[option])
 
-        with st.spinner("Processing mineral image..."):
-            feature = extract_feature(image)
-            label, probs = classify_feature(feature)
-
-        st.success("Processing complete")
-
-        st.subheader("Result")
-
-        col_img, col_res = st.columns([1,2])
-
-        with col_img:
+        if os.path.exists(path):
+            image = Image.open(path).convert("RGB")
             st.image(image, width=300)
+        else:
+            st.error("Sample image not found")
 
-        with col_res:
+# ---------------- CAMERA ----------------
 
-            st.markdown(f"### Prediction: **{label}**")
+elif input_mode == "Camera":
+    cam = st.camera_input("Capture image")
 
-            if label != "unknown":
+    if cam:
+        image = Image.open(cam).convert("RGB")
 
-                st.markdown("#### Class Probabilities")
+# ---------------- UPLOAD ----------------
 
-                for c, p in zip(CLASSES, probs):
-                    st.write(f"**{c}**")
-                    st.progress(float(p))
-                    st.write(f"{p*100:.2f}%")
+elif input_mode == "Upload":
+    file = st.file_uploader("Upload image", type=["jpg","jpeg","png"])
 
-            else:
-                st.error("Out-of-distribution sample detected")
-               
-# --------------------------------------------------------
-# ABOUT PROJECT
-# --------------------------------------------------------
+    if file:
+        image = Image.open(file).convert("RGB")
 
-st.markdown("<hr style='border:2px dotted gray'>", unsafe_allow_html=True)
+
+        st.set_page_config(
+    page_title="Geological Material Detection",
+    layout="wide"
+)
+
+
+# ============================================================
+# PREDICTION
+# ============================================================
+
+if image is None:
+    st.warning("Please select or upload an image first.")
+    st.stop()
+
+else:
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.subheader("Result")
+
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        st.image(image, width=300)
+
+    with col2:
+
+        import numpy as np
+
+       # ---- PREPROCESS ----
+img_tensor = transform(image).unsqueeze(0).to(DEVICE)
+
+with torch.no_grad():
+    
+    outputs = model(img_tensor)
+
+    # ---- CLASSIFICATION ----
+    probs = F.softmax(outputs, dim=1)
+    pred = torch.argmax(probs, dim=1).item()
+
+    # ---- FEATURE EXTRACTION ----
+    feat = feature_extractor(img_tensor)
+    feat = feat.view(feat.size(0), -1)
+    feat = feat.cpu().numpy().flatten()
+
+# ---- NORMALIZATION (OUTSIDE BLOCK) ----
+feat = feat / (np.linalg.norm(feat) + 1e-8)
+
+# ---- COSINE DISTANCE ----
+distance = 1 - np.dot(feat, means[pred])
+
+# ---- OOD CHECK ----
+distance = 1 - np.dot(feat, means[pred])
+if distance > 0.55:
+    
+    st.error("Unknown Mineral (OOD detected)")
+    st.write(f"Distance: {distance:.4f}")
+
+else:
+    # ensure probs is 1D tensor
+    probs = F.softmax(outputs, dim=1).squeeze()
+
+    label = CLASSES[pred]
+    confidence = probs[pred].item()
+
+    st.success(f"Prediction: {label}")
+    st.write(f"Confidence: {confidence*100:.2f}%")
+    st.write(f"Distance: {distance:.4f}")
+  
+  
+   # ---- ABOUT PROJECT
+
+st.markdown("", unsafe_allow_html=True)
 
 st.subheader("About the Project")
 
-st.write("""
-This application implements an automated *Geological Material Detection*.
-
-The system utilizes a *DINOv2 Vision Transformer encoder* to extract semantic
-features from  images. These features are processed by a 
-*MMD-MLP classifier* trained to categorize geological samples into four classes:
-
-* Crystal 
-* mineral  
-* mineral_ore  
-* gem  
-
-To ensure reliability, the system incorporates **Mahalanobis distance-based
-Out-of-Distribution (OOD) detection**, which identifies  images that do
-not belong to the trained distribution and labels them as *unknown*.
-
-Images can be provided through three input modes:
-
-* Dropdown sample selection  
-* Camera capture  
-* Image upload  
-
-After input, the system performs **feature extraction → classification → OOD
-verification** before presenting the predicted mineral class and probability
-distribution.
+st.write(""" To improve reliability, the system incorporates Out-of-Distribution (OOD)
+detection using cosine similarity in the learned feature space. If an input
+image does not resemble the training data distribution, it is labeled as
+Unknown Mineral. Only validated predictions are displayed to the user.
 """)
 
 st.subheader("Acknowledgement")
 
 st.write("""
-This project was supported under the **TEXMiN UG/PG Fellowship**, a Technology
-Innovation Hub at **IIT (ISM) Dhanbad**, and carried out under an institutional
-**MoU collaboration with the National Institute of Technology Nagaland**.
+This project was supported under the TEXMiN UG/PG Fellowship, a Technology
+Innovation Hub at IIT (ISM) Dhanbad, and carried out under an institutional
+MoU collaboration with the National Institute of Technology Nagaland.
 """)
 
 st.subheader("Supervisor")
 
 st.write("""
-I express my sincere gratitude to  
-**Dr. Dushmanta Kumar Das**, Associate Professor,  
-Department of Electrical and Electronics Engineering,  
-**National Institute of Technology Nagaland**,  
+I express my sincere gratitude to
+Dr. Dushmanta Kumar Das, Associate Professor,
+Department of Electrical and Electronics Engineering,
+National Institute of Technology Nagaland,
 for his continuous guidance, valuable insights and academic support
-throughout the development of this Geological Material Detection system.
+throughout the development of this Mineral Classification system.
 """)
 
 st.markdown(
-    "<h3 style='text-align:center;color:green;'>Thank You</h3>",
-    unsafe_allow_html=True
+"<h3 style='text-align:center;color:green;'>Thank You</h3>",
+unsafe_allow_html=True
 )
