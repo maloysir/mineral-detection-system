@@ -8,17 +8,47 @@ import pickle
 from torchvision import transforms
 from torchvision.models import resnet50
 import io
+import gdown
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # ✅ ADD FASTAPI
 from fastapi import FastAPI, File, UploadFile
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---- CONFIG ----
-MODEL_PATH = "best_resnet50.pth"
 DEVICE = torch.device("cpu")
+MODEL_PATH = os.path.join(BASE_DIR, "best_resnet50.pth")
+
+def load_model():
+    model = resnet50(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
+
+    # ✅ Ensure model exists
+    if not os.path.exists(MODEL_PATH):
+        url = "https://drive.google.com/uc?id=16knNIyEL_biTfWMOWiKzWQgJzuAJ1y0L"
+        gdown.download(url, MODEL_PATH, quiet=False)
+
+    # ❌ remove weights_only=True
+    model.load_state_dict(
+        torch.load(MODEL_PATH, map_location=DEVICE)
+    )
+
+    model.to(DEVICE)
+    model.eval()
+    return model
+
 
 # ---- CLASSES ----
 CLASSES = [
@@ -36,22 +66,20 @@ transform = transforms.Compose([
     )
 ])
 
-# ---- MODEL LOADING ----
-def load_model():
-    model = resnet50(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.to(DEVICE)
-    model.eval()
-    return model
+model = None
+feature_extractor = None
 
-model = load_model()
+def get_model():
+    global model, feature_extractor
 
-# Feature extractor
-feature_extractor = nn.Sequential(*list(model.children())[:-1])
-feature_extractor.to(DEVICE)
-feature_extractor.eval()
+    if model is None:
+        model = load_model()
 
+        feature_extractor = nn.Sequential(*list(model.children())[:-1])
+        feature_extractor.to(DEVICE)
+        feature_extractor.eval()
+
+    return model, feature_extractor
 # ---- LOAD OOD ----
 with open("ood_stats_resnet.pkl", "rb") as f:
     stats = pickle.load(f)
@@ -63,52 +91,49 @@ threshold = stats["threshold"]
 # ============================================================
 # ✅ FASTAPI ENDPOINT (ONLY ADDITION)
 # ============================================================
+@app.get("/")
+def health():
+    return {"status": "server awake"}
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
 
-    # ✅ FIX: DEFINE image
-    image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    try:
+        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    except:
+        return {"error": "Invalid image"}
 
-    # ---- PREPROCESS ----
     img_tensor = transform(image).unsqueeze(0).to(DEVICE)
+    
+    model, feature_extractor = get_model()
 
     with torch.no_grad():
         
         outputs = model(img_tensor)
 
-        # ---- CLASSIFICATION ----
         probs = F.softmax(outputs, dim=1)
         pred = torch.argmax(probs, dim=1).item()
 
-        # ---- FEATURE EXTRACTION ----
         feat = feature_extractor(img_tensor)
         feat = feat.view(feat.size(0), -1)
         feat = feat.cpu().numpy().flatten()
 
-    # ---- NORMALIZATION ----
     feat = feat / (np.linalg.norm(feat) + 1e-8)
 
-    # ---- COSINE DISTANCE ----
     distance = 1 - np.dot(feat, means[pred])
 
-    # ---- OOD CHECK ----
+   # ---- OOD CHECk----
     if distance > 0.55:
-
         return {
-            "label": "Unknown Mineral",
+            "label": "unknown",
             "confidence": 0.0,
             "distance": float(distance)
         }
+    label = CLASSES[pred]
+    confidence = probs[0][pred].item()
 
-    else:
-        probs = F.softmax(outputs, dim=1).squeeze()
-
-        label = CLASSES[pred]
-        confidence = probs[pred].item()
-
-        return {
-            "label": label,
-            "confidence": float(confidence),
-            "distance": float(distance)
-        }
+    return {
+        "label": label,
+        "confidence": float(confidence),
+        "distance": float(distance)
+    }
